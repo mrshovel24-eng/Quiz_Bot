@@ -8,7 +8,7 @@ import certifi
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
-from aiohttp import web  # for web server
+from aiohttp import web  # for web server (kept in case you use it)
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters.command import Command
 from aiogram.fsm.context import FSMContext
@@ -37,7 +37,7 @@ dp = Dispatcher(storage=storage)
 
 # MongoDB
 client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
-SYSTEM_DBS = {"admin","local","config","_quiz_meta_"}
+SYSTEM_DBS = {"admin", "local", "config", "_quiz_meta_"}
 meta_db = client["_quiz_meta_"]
 user_progress_col = meta_db["user_progress"]
 user_results_col = meta_db["user_results"]
@@ -131,16 +131,83 @@ def get_correct_answer(q):
         if raw.isdigit(): return {'1':'a','2':'b','3':'c','4':'d'}.get(raw,'a')
         m = re.search(r'([abcd])',raw)
         return m.group(1) if m else 'a'
-    except: return 'a'
+    except:
+        return 'a'
 
-    return random.choice(["Great job! 💪","Nice! 🚀","Well done! 🔥","Progress over perfection ✅"])
+def format_question_card(q: Dict[str,Any]) -> str:
+    """
+    Use your script's logic to show question + options in a readable card.
+    """
+    qtext = clean_question_text(q.get("question") or q.get("text") or "")
+    opts = {}
+    for letter in ['a','b','c','d']:
+        candidate = (
+            q.get(f"option_{letter}") or q.get(letter) or q.get(letter.upper()) or q.get(f"opt_{letter}")
+        )
+        if candidate:
+            opts[letter] = candidate
+            continue
+        if isinstance(q.get("options"), dict) and q["options"].get(letter):
+            opts[letter] = q["options"][letter]
+            continue
+        if isinstance(q.get("options"), list):
+            idx = ord(letter) - 97
+            if idx < len(q["options"]):
+                opts[letter] = q["options"][idx]
+                continue
+        opts[letter] = ""
+    parts = [qtext, ""]
+    parts += [f"A: {opts['a']}", f"B: {opts['b']}", f"C: {opts['c']}", f"D: {opts['d']}"]
+    return "\n".join(parts).strip()
+
+def get_correct_option_text(q: Dict[str,Any], correct_letter: str) -> str:
+    try:
+        field = f"option_{correct_letter}"
+        if field in q and q[field]:
+            return q[field]
+        for variant in [correct_letter, correct_letter.upper(), f"opt_{correct_letter}"]:
+            if variant in q and q[variant]:
+                return q[variant]
+        if isinstance(q.get("options"), dict) and q["options"].get(correct_letter):
+            return q["options"][correct_letter]
+        if isinstance(q.get("options"), list):
+            idx = ord(correct_letter) - 97
+            if idx < len(q["options"]):
+                return q["options"][idx]
+        return ""
+    except Exception as e:
+        logger.exception(f"Error getting correct option text: {e}")
+        return ""
+
+def motivational_message() -> str:
+    msgs = [
+        "Great job! Keep going 💪",
+        "Nice! Every attempt makes you sharper 🚀",
+        "Well done! 🔥",
+        "Progress over perfection ✅",
+    ]
+    return random.choice(msgs)
 
 async def is_channel_member(user_id):
     try:
         if CHANNEL_TO_JOIN is None: return True
         member = await bot.get_chat_member(CHANNEL_TO_JOIN, user_id)
         return member.status in ['member','administrator','creator']
-    except: return False
+    except:
+        return False
+
+def build_option_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        [
+            InlineKeyboardButton(text="A", callback_data="answer:A"),
+            InlineKeyboardButton(text="B", callback_data="answer:B")
+        ],
+        [
+            InlineKeyboardButton(text="C", callback_data="answer:C"),
+            InlineKeyboardButton(text="D", callback_data="answer:D")
+        ]
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 # ---------------- Handlers ----------------
 @dp.message(Command(commands=['start']))
@@ -176,7 +243,6 @@ async def help_callback(callback: CallbackQuery):
     "You will get *10 questions* per quiz.\n"
     "Each question appears as a single interactive message with multiple-choice options.\n"
     "Once you answer a question, the next one appears and replaces the previous message.\n"
-    "⏱ All questions are available for *10 minutes* only.\n\n"
     
     "5️⃣ *Quiz Completion*\n"
     "After answering all questions, your *score* will be shown.\n"
@@ -254,73 +320,95 @@ async def topic_callback(callback: CallbackQuery, state: FSMContext):
         quiz_locked=True
     )
     await callback.message.edit_text(f"🚀 Starting quiz: {subject} - {topic}", reply_markup=None)
-    await send_next_question(bot, callback.message.chat.id, state)
+    # start quiz using inline keyboard send_next_question (uses Message object)
+    # we'll call send_next_question with a fake Message-like object? no - use callback.message
+    await send_next_question(callback.message, state)
 
-# ---------------- Quiz Flow ----------------
-async def send_next_question(bot: Bot, chat_id:int, state:FSMContext):
-    data = await state.get_data()
-    questions = data.get("questions",[])
-    current = int(data.get("current_question",0))
-    if current>=len(questions):
-        score = int(data.get("score",0))
-        total = len(questions)
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Start Again", callback_data="start_again")],
-            [InlineKeyboardButton(text="📢 Report Issue", callback_data="report_issue")]
-
-        ])
-        nk = "📢 Forward these questions if you want!\n\n⏱️ These questions will auto-delete after 5 minutes"
-        await bot.send_message(
-                             chat_id, 
-    f"🎉 Quiz finished!\n✅ Correct: {score}\n❌ Wrong: {total-score}\n\n{nk}", 
-    reply_markup=kb
-)
-
-        await state.set_state(QuizStates.post_quiz)
-        await state.update_data(subject_locked=False, topic_locked=False, quiz_locked=False)
-        return
-    q = questions[current]
-    opts = [q.get("option_a",""), q.get("option_b",""), q.get("option_c",""), q.get("option_d","")]
-    qtext = clean_question_text(q.get("question") or q.get("text"))
-    correct_index = {"a":0,"b":1,"c":2,"d":3}.get(get_correct_answer(q),0)
-    poll_msg = await bot.send_poll(chat_id, question=f"Q{current+1}: {qtext}", options=opts,
-                                   type="quiz", correct_option_id=correct_index, is_anonymous=False)
-    await state.update_data(current_poll_id=poll_msg.poll.id)
-    # Auto delete after 10 minutes
-    asyncio.create_task(auto_delete(poll_msg.message_id, chat_id, 300))
-
-async def auto_delete(message_id, chat_id, delay):
-    await asyncio.sleep(delay)
+# ---------------- Quiz Flow (inline keyboard based) ----------------
+async def send_next_question(message: Message, state: FSMContext):
     try:
-        await bot.delete_message(chat_id, message_id)
-    except: pass
+        data = await state.get_data()
+        questions = data.get('questions', [])
+        current = int(data.get('current_question', 0))
+        if current >= len(questions):
+            score = int(data.get('score', 0))
+            total = len(questions)
+            user_results_col.insert_one({
+                "user_id": message.chat.id,
+                "db": data.get('subject'),
+                "col": data.get('topic') or "_RANDOM_",
+                "score": score,
+                "total": total,
+                "date": datetime.now(timezone.utc)
+            })
+            post_quiz_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔄 Restart", callback_data="start_again")],
+                [InlineKeyboardButton(text="📢 Report an issue", callback_data="report_issue")]
+            ])
+            nk = "📢 Forward these questions if you want!\n\n⏱️ These questions will auto-delete after 5 minutes"
+            await message.reply(f"🎉 Quiz finished!\n\n✅ Correct: {score}\n\n❌ Wrong: {total - score}\n\n{nk}", reply_markup=post_quiz_keyboard)
+            await state.set_state(QuizStates.post_quiz)
+            # unlock subject/topic/quiz locks
+            await state.update_data(subject_locked=False, topic_locked=False, quiz_locked=False)
+            return
 
-@dp.poll_answer()
-async def poll_answer_handler(poll: types.PollAnswer, state:FSMContext):
+        q = questions[current]
+        question_text = format_question_card(q)
+        await state.update_data(question_locked=False)
+        # send question as a normal message with inline option buttons
+        await bot.send_message(message.chat.id, f"Question {current+1}:\n\n{question_text}", reply_markup=build_option_keyboard())
+        await state.set_state(QuizStates.answering_quiz)
+    except Exception as e:
+        logger.exception("Error in send_next_question")
+        await message.reply("❌ Error loading question. Please try again later.")
+
+@dp.callback_query(QuizStates.answering_quiz, F.data.startswith("answer:"))
+async def answer_callback(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    if poll.poll_id != data.get("current_poll_id"): return
-    questions = data.get("questions",[])
-    current = int(data.get("current_question",0))
-    if current>=len(questions): return
+    if data.get("question_locked", False):
+        await callback.answer("⏳ Please wait for the next question!", show_alert=True)
+        return
+    # lock further answers until we process
+    await state.update_data(question_locked=True)
+    await callback.answer()
+
+    user_answer = callback.data.split(":", 1)[1].lower()
+    questions = data.get('questions', [])
+    current = int(data.get('current_question', 0))
+    if current >= len(questions):
+        await callback.message.reply("No active question. Start again.")
+        await state.clear()
+        return
+
     q = questions[current]
-    correct_index = {"a":0,"b":1,"c":2,"d":3}.get(get_correct_answer(q),0)
-    chosen = poll.option_ids[0] if poll.option_ids else -1
-    score = int(data.get("score",0)) + (1 if chosen==correct_index else 0)
-    await state.update_data(current_question=current+1, score=score)
-    chat_id = data.get("quiz_chat_id")
+    correct_answer = get_correct_answer(q)
+    correct_option_text = get_correct_option_text(q, correct_answer)
+    score = int(data.get('score', 0))
+    if user_answer == correct_answer:
+        response = f"✅ Correct! ({correct_answer.upper()}) {correct_option_text}"
+        score += 1
+    else:
+        response = f"❌ Wrong!\n\nCorrect answer: ({correct_answer.upper()}) {correct_option_text}"
+
+    # reply to the callback message (user will see result)
+    await callback.message.reply(response)
+    await state.update_data(current_question=current + 1, score=score)
+    # small delay so user sees result
     await asyncio.sleep(1)
-    await send_next_question(bot, chat_id, state)
+    # send next question (message object is callback.message)
+    await send_next_question(callback.message, state)
 
 # ---------------- Post Quiz ----------------
 @dp.callback_query(QuizStates.post_quiz, F.data=="start_again")
 async def start_again_callback(callback: CallbackQuery, state:FSMContext):
     await callback.answer()
+    # reuse ready flow
     await ready_callback(callback, state)
 
 @dp.callback_query(QuizStates.post_quiz, F.data=="report_issue")
 async def report_issue_callback(callback: CallbackQuery, state:FSMContext):
     await callback.answer()
-    await callback.message.reply("📷 Send screenshot or describe the issue.")
+    await callback.message.reply("📷 Please send a screenshot or describe the issue.")
     await state.set_state(QuizStates.reporting_issue)
 
 @dp.message(QuizStates.reporting_issue)
@@ -342,46 +430,25 @@ async def report_issue_handler(message: Message, state: FSMContext):
             photo = message.photo[-1]
             await bot.send_photo(REPORT_CHANNEL_ID, photo.file_id, caption=f"🚨 Issue from @{username}")
 
-        # Forward polls
-        elif message.poll:
-            poll = message.poll
-            options = [opt.text for opt in poll.options]
-            correct_id = poll.correct_option_id if poll.type == "quiz" else None
-            await bot.send_poll(
-                REPORT_CHANNEL_ID,
-                question=f"🚨 Issue from @{username}: {poll.question}",
-                options=options,
-                type=poll.type,
-                correct_option_id=correct_id,
-                is_anonymous=poll.is_anonymous
-            )
-
+        # ✅ Send confirmation with start menu
         await message.reply("✅ Report sent!", reply_markup=start_menu())
+
+        # Reset locks
+        await state.update_data(quiz_locked=False, subject_locked=False, topic_locked=False)
+
+        # IMPORTANT: set state to waiting_for_ready again
+        await state.set_state(QuizStates.waiting_for_ready)
+
     except Exception as e:
         logger.exception(f"Failed to forward report: {e}")
         await message.reply("❌ Failed to send report.")
-    
-    await state.update_data(quiz_locked=False)
-    await state.clear()
 
-    user_id = message.from_user.id
-    username = message.from_user.username or "Unknown"
-    try:
-        if message.text:
-            text = f"🚨 Issue from @{username} (ID:{user_id}):\n{message.text}"
-            if REPORT_CHANNEL_ID: await bot.send_message(REPORT_CHANNEL_ID, text)
-        elif message.photo:
-            photo = message.photo[-1]
-            if REPORT_CHANNEL_ID: await bot.send_photo(REPORT_CHANNEL_ID, photo.file_id, caption=f"🚨 Issue from @{username}")
-        await message.reply("✅ Report sent!", reply_markup=start_menu())
-    except: await message.reply("❌ Failed to send report")
-    await state.update_data(quiz_locked=False)
-    await state.clear()
+# ---------------- Alive Checker ----------------
 async def alive_checker():
     while True:
         try:
             if REPORT_CHANNEL_ID:
-                await bot.send_message(REPORT_CHANNEL_ID, f"🤖 I am alive! Time:")
+                await bot.send_message(REPORT_CHANNEL_ID, f"🤖 I am alive! Time")
         except Exception as e:
             logger.exception("Error sending alive message")
         await asyncio.sleep(300)  # 5 minutes
