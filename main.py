@@ -220,8 +220,8 @@ async def start_handler(message: Message, state: FSMContext):
         await state.set_state(QuizStates.waiting_for_ready)
     else:
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton("🔗 Join Now", url="https://t.me/usersforstudy")],
-            [InlineKeyboardButton("✅ Try Again", callback_data="try_again")]
+            [InlineKeyboardButton(text="🔗 Join Now", url="https://t.me/usersforstudy")],
+            [InlineKeyboardButton(text="✅ Try Again", callback_data="try_again")]
         ])
         await message.reply("🔒 Join channel first.", reply_markup=kb)
 
